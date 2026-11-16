@@ -40,6 +40,8 @@
   .msg.info{background:var(--accent-fraco);color:var(--accent);}
   .oculto{display:none !important;}
   .rodape{font-size:.72rem;color:var(--muted);text-align:center;margin-top:1rem;line-height:1.5;}
+  .credito{margin-top:.4rem;font-size:.72rem;opacity:.75;}
+  .credito a{color:inherit;}
 </style>
 </head>
 <body>
@@ -65,19 +67,24 @@
   </div>
 
   <p class="rodape">Só o seu professor ouve esta gravação. Ela é apagada no fim do ano letivo.<br>Este link vale uma vez só, por 15 minutos. Depois de enviar, volte ao aplicativo.</p>
+  <p class="rodape credito">Áudio comprimido com <a href="https://lame.sourceforge.io" target="_blank" rel="noopener">LAME</a> (LGPL).</p>
 </main>
 
+<!-- Conversor de MP3 (LAME em JavaScript, LGPL-3.0), em arquivo separado como
+     pede a licença. Se não carregar, a página envia em WAV, como antes. -->
+<script src="lame.min.js"></script>
 <script>
 (function(){
   var MAX = 60;                 /* segundos — o app manda o limite desta aula */
-  var TAXA = 16000;             /* WAV 16 kHz, mono: o formato que a IA aceita em qualquer aparelho */
+  var TAXA = 16000;             /* 16 kHz, mono: suficiente para voz, e o que a IA aceita em qualquer aparelho */
+  var KBPS = 32;                /* MP3 a 32 kbps: 2 min ≈ 0,47 MB (em WAV eram 3,8 MB) */
   var q = new URLSearchParams(location.search);
   var codigo = q.get('c') || '', servidor = q.get('s') || '', tema = q.get('t') || '';
   var roteiro = q.get('r') || '';
   var pedido = parseInt(q.get('seg'), 10);
   if (pedido === 60 || pedido === 90 || pedido === 120) MAX = pedido;
   var $ = function(id){ return document.getElementById(id); };
-  var gravador = null, pedacos = [], fluxo = null, inicio = 0, tique = null, limite = null, wavB64 = '', segundos = 0;
+  var gravador = null, pedacos = [], fluxo = null, inicio = 0, tique = null, limite = null, audioB64 = '', audioMime = '', segundos = 0;
 
   $('tema').textContent = tema ? 'Tema: ' + tema : '';
   $('limite').textContent = MAX + ' segundos';
@@ -140,30 +147,39 @@
     var bruto = new Blob(pedacos, { type: (gravador && gravador.mimeType) || 'audio/webm' });
     if(segundos < 3){ msg('Ficou curto demais. Grave de novo.', 'erro'); mostrar('btGravar', true); return; }
     msg('Preparando o áudio…', 'info');
-    paraWav(bruto).then(function(wav){
-      $('ouvir').src = URL.createObjectURL(wav);
+    var tamanho = 0;
+    paraPcm(bruto).then(function(pcm){
+      /* MP3 primeiro: arquivo 8 vezes menor, envio mais rápido no plano de
+         dados do aluno. Qualquer falha (conversor não carregou, aparelho
+         estranho) cai no WAV — o aluno nunca perde a gravação por isso. */
+      return mp3De(pcm).catch(function(){ return wavDe(pcm); });
+    }).then(function(arq){
+      audioMime = arq.type; tamanho = arq.size;
+      $('ouvir').src = URL.createObjectURL(arq);
       mostrar('ouvir', true); mostrar('btEnviar', true); mostrar('btDeNovo', true);
-      return blobParaBase64(wav);
+      return blobParaBase64(arq);
     }).then(function(b64){
-      wavB64 = b64;
-      msg('Ouça. Se estiver bom, envie. (' + segundos + ' s)', 'info');
+      audioB64 = b64;
+      msg('Ouça. Se estiver bom, envie. (' + segundos + ' s · ' + mega(tamanho) + ')', 'info');
     }).catch(function(e){
       msg('Não consegui preparar o áudio (' + (e && e.message || e) + '). Grave de novo.', 'erro');
       mostrar('btGravar', true);
     });
   }
-  $('btDeNovo').onclick = function(){ wavB64 = ''; mostrar('ouvir', false); mostrar('btEnviar', false); mostrar('btDeNovo', false); mostrar('btGravar', true); semMsg(); relogio(0); };
+  $('btDeNovo').onclick = function(){ audioB64 = ''; audioMime = ''; mostrar('ouvir', false); mostrar('btEnviar', false); mostrar('btDeNovo', false); mostrar('btGravar', true); semMsg(); relogio(0); };
 
   $('btEnviar').onclick = function(){
-    if(!wavB64) return;
+    if(!audioB64) return;
     $('btEnviar').disabled = true; $('btDeNovo').disabled = true;
     msg('Enviando…', 'info');
+    var t0 = Date.now();
     fetch(servidor, { method: 'POST', redirect: 'follow', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ acao: 'voz', c: codigo, mime: 'audio/wav', b64: wavB64, seg: segundos }) })
+      body: JSON.stringify({ acao: 'voz', c: codigo, mime: audioMime || 'audio/wav', b64: audioB64, seg: segundos }) })
       .then(function(r){ return r.json(); })
       .then(function(r){
         if(r && r.status){
-          msg('✓ ' + (r.msg || 'Áudio recebido.'), 'ok');
+          /* O tempo de envio aparece para o professor medir a rede da escola. */
+          msg('✓ ' + (r.msg || 'Áudio recebido.') + ' Enviado em ' + Math.max(1, Math.round((Date.now() - t0) / 1000)) + ' s.', 'ok');
           mostrar('btEnviar', false); mostrar('btDeNovo', false); mostrar('btGravar', false);
           /* A aba se fecha sozinha e o aluno cai de volta no aplicativo, que
              confere a gravação sem mais um toque. Só vale para aba aberta por
@@ -180,8 +196,9 @@
       });
   };
 
-  /* Qualquer formato que o aparelho gravou → WAV 16 kHz, mono, 16 bits. */
-  function paraWav(blob){
+  /* Qualquer formato que o aparelho gravou (webm no Android, mp4 no iPhone)
+     → som "cru" de 16 kHz, mono. Daqui sai o MP3 ou, se não der, o WAV. */
+  function paraPcm(blob){
     return blob.arrayBuffer().then(function(buf){
       var AC = window.AudioContext || window.webkitAudioContext;
       var ac = new AC();
@@ -197,17 +214,49 @@
         });
       });
     }).then(function(ren){
-      var d = ren.getChannelData(0), n = d.length;
-      var b = new ArrayBuffer(44 + n * 2), v = new DataView(b);
-      var esc = function(o, s){ for(var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-      esc(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); esc(8, 'WAVE'); esc(12, 'fmt ');
-      v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-      v.setUint32(24, TAXA, true); v.setUint32(28, TAXA * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-      esc(36, 'data'); v.setUint32(40, n * 2, true);
-      for(var i = 0; i < n; i++){ var x = Math.max(-1, Math.min(1, d[i])); v.setInt16(44 + i * 2, x < 0 ? x * 0x8000 : x * 0x7FFF, true); }
-      return new Blob([b], { type: 'audio/wav' });
+      var d = ren.getChannelData(0), n = d.length, pcm = new Int16Array(n);
+      for(var i = 0; i < n; i++){ var x = Math.max(-1, Math.min(1, d[i])); pcm[i] = x < 0 ? x * 0x8000 : x * 0x7FFF; }
+      return pcm;
     });
   }
+
+  /* MP3 32 kbps, mono. Em fatias, com pausa entre elas: o celular não trava
+     e o aluno vê o andamento. */
+  function mp3De(pcm){
+    return new Promise(function(ok, falha){
+      if(typeof lamejs === 'undefined' || !lamejs.Mp3Encoder){ falha(new Error('sem conversor')); return; }
+      var enc; try { enc = new lamejs.Mp3Encoder(1, TAXA, KBPS); } catch(e){ falha(e); return; }
+      var partes = [], i = 0, QUADRO = 1152, POR_VEZ = QUADRO * 40;
+      (function fatia(){
+        try {
+          var ate = Math.min(pcm.length, i + POR_VEZ);
+          for(; i < ate; i += QUADRO){ var b = enc.encodeBuffer(pcm.subarray(i, Math.min(ate, i + QUADRO))); if(b.length) partes.push(b); }
+          if(i < pcm.length){
+            msg('Preparando o áudio… ' + Math.round(100 * i / pcm.length) + '%', 'info');
+            setTimeout(fatia, 0); return;
+          }
+          var f = enc.flush(); if(f.length) partes.push(f);
+          var arq = new Blob(partes, { type: 'audio/mpeg' });
+          if(arq.size < 1000){ falha(new Error('mp3 vazio')); return; }
+          ok(arq);
+        } catch(e){ falha(e); }
+      })();
+    });
+  }
+
+  function wavDe(pcm){
+    var n = pcm.length, b = new ArrayBuffer(44 + n * 2), v = new DataView(b);
+    var esc = function(o, s){ for(var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    esc(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); esc(8, 'WAVE'); esc(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, TAXA, true); v.setUint32(28, TAXA * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    esc(36, 'data'); v.setUint32(40, n * 2, true);
+    for(var i = 0; i < n; i++) v.setInt16(44 + i * 2, pcm[i], true);
+    return new Blob([b], { type: 'audio/wav' });
+  }
+
+  function mega(bytes){ return bytes >= 1048576 ? (bytes / 1048576).toFixed(1).replace('.', ',') + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB'; }
+
   function blobParaBase64(blob){
     return new Promise(function(ok, falha){
       var r = new FileReader();
